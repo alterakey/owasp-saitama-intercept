@@ -8,9 +8,9 @@ import re
 import ssl
 import sys
 import urllib.parse
-from collections import deque
 from typing import TYPE_CHECKING
 
+import httptools
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 class ProxyProtocol(asyncio.Protocol):
     gen: CertGenerator
+    _srsf: StrictRequestStreamFactory
     _loop: asyncio.AbstractEventLoop
     _transport: Optional[asyncio.Transport]
     _transport2: Optional[asyncio.Transport]
@@ -30,6 +31,7 @@ class ProxyProtocol(asyncio.Protocol):
     def __init__(self, gen: CertGenerator) -> None:
         self._loop = asyncio.get_running_loop()
         self.gen = gen
+        self._srsf = StrictRequestStreamFactory()
         self._transport = None
         self._transport2 = None
         self._transport2p = None
@@ -58,13 +60,23 @@ class ProxyProtocol(asyncio.Protocol):
                 self._loop.create_task(self._prepare_connection(lambda: ClientProtocol0(self, data), t.hostname, 80 if t.port is None else t.port))
         elif self._transport2:
             assert not self._transport2p
-            Printer.req(data)
-            self._transport2.write(data)
+            for r in self._srsf.feed_data(data):
+                if not isinstance(r, Exception):
+                    Printer.req(r.literal)
+                    self._transport2.write(r.literal)
+                else:
+                    print(f'[-] cannot parse request, {str(r)}', file=sys.stderr)
+                    self._transport2.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
         elif self._transport2p:
             assert not self._transport2
             data = re.sub(rb'^([A-Z]+) http://.+?/', rb'\1 /', data, count=1, flags=re.DOTALL)
-            Printer.req(data)
-            self._transport2p.write(data)
+            for r in self._srsf.feed_data(data):
+                if not isinstance(r, Exception):
+                    Printer.req(r.literal)
+                    self._transport2p.write(r.literal)
+                else:
+                    print(f'[-] cannot parse request, {str(r)}', file=sys.stderr)
+                    self._transport2p.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
 
     def connection_lost(self, exc: Any) -> None:
         if self._transport:
@@ -113,10 +125,12 @@ class Printer:
 
 class ClientProtocol0(asyncio.Protocol):
     _proxy: ProxyProtocol
+    _srsf: StrictResponseStreamFactory
     _initial_data: Any
 
     def __init__(self, proxy: ProxyProtocol, initial_data: Any) -> None:
         self._proxy = proxy
+        self._srsf = StrictResponseStreamFactory()
         self._initial_data = initial_data
 
     def connection_made(self, transport: Any) -> None:
@@ -130,17 +144,24 @@ class ClientProtocol0(asyncio.Protocol):
                 self._proxy._transport2p.close()
                 self._proxy._transport2p = None
         else:
-            Printer.resp(data)
-            self._proxy._transport.write(data)
+            for resp in self._srsf.feed_data(data):
+                if not isinstance(resp, Exception):
+                    Printer.resp(resp.literal)
+                    self._proxy._transport.write(resp.literal)
+                else:
+                    print(f'[-] cannot parse response, {str(resp)}', file=sys.stderr)
+                    self._proxy._transport.write(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
 
     def connection_lost(self, exc: Any) -> None:
         self._proxy.connection_lost(exc)
 
 class ClientProtocol(asyncio.Protocol):
     _proxy: ProxyProtocol
+    _srsf: StrictResponseStreamFactory
 
     def __init__(self, proxy: ProxyProtocol, urlcomp: Any) -> None:
         self._proxy = proxy
+        self._srsf = StrictResponseStreamFactory()
         self._urlcomp = urlcomp
 
     def connection_made(self, transport: Any) -> None:
@@ -168,8 +189,14 @@ class ClientProtocol(asyncio.Protocol):
                 self._proxy._transport2.close()
                 self._proxy._transport2 = None
         else:
-            Printer.resp(data)
-            self._proxy._transport.write(data)
+            for resp in self._srsf.feed_data(data):
+                if not isinstance(resp, Exception):
+                    Printer.resp(resp.literal)
+                    self._proxy._transport.write(resp.literal)
+                else:
+                    print(f'[-] cannot parse response, {str(resp)}', file=sys.stderr)
+                    self._proxy._transport.write(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+
 
     def connection_lost(self, exc: Any) -> None:
         self._proxy.connection_lost(exc)
@@ -263,6 +290,68 @@ class CAGenerator:
     def _put_ca_key_data(self, data: bytes) -> None:
         with open(self._cakeypath, 'wb') as f:
             f.write(data)
+
+class Request:
+    literal: bytes = b''
+    def __init__(self, literal: bytes) -> None:
+        self.literal = literal
+
+class Response:
+    literal: bytes = b''
+    def __init__(self, literal: bytes) -> None:
+        self.literal = literal
+
+class StrictRequestStreamFactory:
+  _content: bytearray
+  _parser: httptools.HttpRequestParser
+  _results: List[Union[Request, Exception]]
+  def __init__(self) -> None:
+    self._content = bytearray()
+    self._parser = httptools.HttpRequestParser(self)
+    self._results = []
+
+  def feed_data(self, data: bytes) -> List[Union[Request, Exception]]:
+    self._results.clear()
+    for c in data.splitlines(keepends=True):
+      try:
+        self._parser.feed_data(c)
+      except Exception as e:
+        self._results.append(e)
+        self._content.clear()
+      else:
+        self._content.extend(c)
+    return self._results
+
+  def on_message_begin(self) -> None:
+    self._content.clear()
+  def on_message_complete(self) -> None:
+    self._results.append(Request(self._content))
+
+class StrictResponseStreamFactory:
+  _content: bytearray
+  _parser: httptools.HttpResponseParser
+  _results: List[Union[Response, Exception]]
+  def __init__(self) -> None:
+    self._content = bytearray()
+    self._parser = httptools.HttpResponseParser(self)
+    self._results = []
+
+  def feed_data(self, data: bytes) -> List[Union[Response, Exception]]:
+    self._results.clear()
+    for c in data.splitlines(keepends=True):
+      try:
+        self._parser.feed_data(c)
+      except Exception as e:
+        self._results.append(e)
+        self._content.clear()
+      else:
+        self._content.extend(c)
+    return self._results
+
+  def on_message_begin(self) -> None:
+    self._content.clear()
+  def on_message_complete(self) -> None:
+    self._results.append(Response(self._content))
 
 
 async def main(host_port: Tuple[str,int], gen: CertGenerator) -> None:
